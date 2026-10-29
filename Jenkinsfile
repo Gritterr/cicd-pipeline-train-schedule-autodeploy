@@ -1,79 +1,78 @@
+// CI/CD for the Train Schedule app. Every new commit on master is built and
+// tested as a Docker image, pushed to Docker Hub, and deployed to Kubernetes.
 pipeline {
-    agent any
+    // The agent "test-server" has Docker and kubectl, and is the k3s cluster's node
+    agent { label 'test-server' }
     environment {
-        //be sure to replace "willbla" with your own Docker Hub username
-        DOCKER_IMAGE_NAME = "willbla/train-schedule"
+        DOCKER_IMAGE_NAME = 'saviochristopher/train-schedule'
+        APP_URL = 'http://localhost:30080'
+    }
+    triggers {
+        // GitHub cannot reach this Jenkins to deliver a webhook, so Jenkins
+        // checks the repo for new commits every minute instead
+        pollSCM('* * * * *')
+    }
+    options {
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
     }
     stages {
-        stage('Build') {
+        stage('Build & Test Image') {
             steps {
-                echo 'Running build automation'
-                sh './gradlew build --no-daemon'
-                archiveArtifacts artifacts: 'dist/trainSchedule.zip'
+                // The Dockerfile runs the unit tests, so a failing test fails this stage
+                sh 'docker build -t "$DOCKER_IMAGE_NAME:$BUILD_NUMBER" -t "$DOCKER_IMAGE_NAME:latest" .'
             }
         }
-        stage('Build Docker Image') {
-            when {
-                branch 'master'
-            }
+        stage('Push to Docker Hub') {
             steps {
-                script {
-                    app = docker.build(DOCKER_IMAGE_NAME)
-                    app.inside {
-                        sh 'echo Hello, World!'
-                    }
+                withCredentials([usernamePassword(credentialsId: 'docker-hub',
+                        usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_TOKEN')]) {
+                    sh '''
+                        # Log in for this build only, outside the agent user's ~/.docker
+                        export DOCKER_CONFIG="$WORKSPACE@tmp/docker"
+                        trap 'docker logout >/dev/null; rm -rf "$DOCKER_CONFIG"' EXIT
+                        echo "$DOCKER_TOKEN" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker push "$DOCKER_IMAGE_NAME:$BUILD_NUMBER"
+                        docker push "$DOCKER_IMAGE_NAME:latest"
+                    '''
                 }
             }
         }
-        stage('Push Docker Image') {
-            when {
-                branch 'master'
-            }
+        stage('Deploy to Kubernetes') {
             steps {
-                script {
-                    docker.withRegistry('https://registry.hub.docker.com', 'docker_hub_login') {
-                        app.push("${env.BUILD_NUMBER}")
-                        app.push("latest")
-                    }
+                // Fill in this build's image tag, apply, and wait for the rolling update
+                sh '''
+                    export KUBECONFIG="$HOME/.kube/config"
+                    envsubst '$DOCKER_IMAGE_NAME $BUILD_NUMBER' < k8s/train-schedule.yml | kubectl apply -f -
+                    kubectl rollout status deployment/train-schedule-deployment --timeout=180s
+                '''
+            }
+            post {
+                failure {
+                    // The new pods never became ready: go back to the previous version
+                    sh 'KUBECONFIG="$HOME/.kube/config" kubectl rollout undo deployment/train-schedule-deployment || true'
                 }
             }
         }
-        stage('CanaryDeploy') {
-            when {
-                branch 'master'
-            }
-            environment { 
-                CANARY_REPLICAS = 1
-            }
+        stage('Smoke Test') {
             steps {
-                kubernetesDeploy(
-                    kubeconfigId: 'kubeconfig',
-                    configs: 'train-schedule-kube-canary.yml',
-                    enableConfigSubstitution: true
-                )
+                sh '''
+                    curl -fsS "$APP_URL/" | grep -q "Find your train"
+                    curl -fsS "$APP_URL/trains" | grep -q '"name"'
+                    echo "Deployed $DOCKER_IMAGE_NAME:$BUILD_NUMBER: http://10.79.140.67:30080/"
+                '''
+            }
+            post {
+                failure {
+                    sh 'KUBECONFIG="$HOME/.kube/config" kubectl rollout undo deployment/train-schedule-deployment || true'
+                }
             }
         }
-        stage('DeployToProduction') {
-            when {
-                branch 'master'
-            }
-            environment { 
-                CANARY_REPLICAS = 0
-            }
-            steps {
-                input 'Deploy to Production?'
-                milestone(1)
-                kubernetesDeploy(
-                    kubeconfigId: 'kubeconfig',
-                    configs: 'train-schedule-kube-canary.yml',
-                    enableConfigSubstitution: true
-                )
-                kubernetesDeploy(
-                    kubeconfigId: 'kubeconfig',
-                    configs: 'train-schedule-kube.yml',
-                    enableConfigSubstitution: true
-                )
-            }
+    }
+    post {
+        always {
+            // The cluster pulls images from Docker Hub, so the agent keeps only :latest
+            sh 'docker rmi "$DOCKER_IMAGE_NAME:$BUILD_NUMBER" >/dev/null 2>&1 || true; docker image prune -f >/dev/null'
         }
     }
 }
