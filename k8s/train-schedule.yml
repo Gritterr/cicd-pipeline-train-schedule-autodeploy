@@ -40,6 +40,9 @@ spec:
       containers:
       - name: train-schedule
         image: $DOCKER_IMAGE_NAME:$BUILD_NUMBER
+        env:
+        - name: APP_VERSION   # shown on the home page
+          value: "$BUILD_NUMBER"
         ports:
         - containerPort: 8080
         readinessProbe:   # receives traffic only once the page loads

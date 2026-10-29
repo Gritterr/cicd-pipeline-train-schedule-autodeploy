@@ -57,7 +57,8 @@ pipeline {
         stage('Smoke Test') {
             steps {
                 sh '''
-                    curl -fsS "$APP_URL/" | grep -q "Find your train"
+                    # The home page must load and show this build's number
+                    curl -fsS "$APP_URL/" | grep -q "build $BUILD_NUMBER"
                     curl -fsS "$APP_URL/trains" | grep -q '"name"'
                     echo "Deployed $DOCKER_IMAGE_NAME:$BUILD_NUMBER: http://10.79.140.67:30080/"
                 '''
